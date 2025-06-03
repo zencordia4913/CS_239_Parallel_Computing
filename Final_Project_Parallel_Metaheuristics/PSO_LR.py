@@ -1,0 +1,355 @@
+import numpy as np
+import time
+import pycuda.autoinit
+import pycuda.driver as drv
+from pycuda.compiler import SourceModule
+from sklearn.datasets import load_breast_cancer
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import confusion_matrix, accuracy_score, precision_score, recall_score, f1_score, matthews_corrcoef
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+import psutil
+
+
+# Kernel code
+kernel_code = """
+__global__ void evaluate_fitness(float *hyperparameters, float *data, float *labels, float *accuracies,
+                                 int num_features, int num_samples, int pop_size, unsigned long long seed) {
+
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < pop_size) {
+        int penalty_idx = int(hyperparameters[4 * idx]);
+        float C = hyperparameters[4 * idx + 1];
+        int solver_idx = int(hyperparameters[4 * idx + 2]); 
+        float l_r = hyperparameters[4 * idx + 3];
+
+        // Initialize hyperparameters
+        float penalty = penalty_idx == 0 ? 0 : 1; // Assuming 0 for L1 and 1 for L2
+
+        // Allocate global memory for weights and gradients
+        float *weight = new float[num_features];
+        float *gradients = new float[num_features];
+        float initial_weight = idx * 0.01;
+
+        // Initialize weights with small random values
+        for (int i = 0; i < num_features; i++) {
+            weight[i] = initial_weight;
+        }
+
+        float learning_rate = l_r;
+        int num_iterations = 100; // Increase number of iterations
+
+        for (int iter = 0; iter < num_iterations; iter++) {
+            // Initialize gradients to zero
+            for (int j = 0; j < num_features; j++) {
+                gradients[j] = 0.0;
+            }
+            // Compute gradients
+            for (int sample = 0; sample < num_samples; sample++) {
+                float linear_combination = 0.0;
+                for (int j = 0; j < num_features; j++) {
+                    linear_combination += data[sample * num_features + j] * weight[j];
+                }
+                float prediction = 1.0 / (1.0 + exp(-linear_combination));
+                float error = prediction - labels[sample];
+                for (int j = 0; j < num_features; j++) {
+                    gradients[j] += data[sample * num_features + j] * error;
+                }
+            }
+
+            // Update weights with L1 or L2 penalty based on the value of penalty
+            if (penalty == 0) { // L1 penalty
+                for (int j = 0; j < num_features; j++) {
+                    float regularization_term = (weight[j] > 0) ? C : -C;
+                    weight[j] -= learning_rate * (gradients[j] / num_samples + regularization_term / num_samples);
+                }
+            } else if (penalty == 1) { // L2 penalty
+                for (int j = 0; j < num_features; j++) {
+                    weight[j] -= learning_rate * (gradients[j] / num_samples + 2 * C * weight[j]);
+                }
+            }
+        }
+
+        // Calculate accuracy
+        int correct_predictions = 0;
+        for (int sample = 0; sample < num_samples; sample++) {
+            float linear_combination = 0.0;
+            for (int j = 0; j < num_features; j++) {
+                linear_combination += data[sample * num_features + j] * weight[j];
+            }
+            float prediction = 1.0 / (1.0 + exp(-linear_combination));
+            int predicted_label = (prediction >= 0.5) ? 1 : 0;
+            if (predicted_label == int(labels[sample])) {
+                correct_predictions += 1;
+            }
+        }
+        accuracies[idx] = (float)correct_predictions / num_samples;
+
+        // Print debug messages
+        printf("Thread %d: penalty_idx=%d, C_idx=%f, solver_idx=%d, accuracy=%f\\n",
+               idx, penalty_idx, C, solver_idx, accuracies[idx]);
+
+        // Free dynamically allocated memory
+        delete[] weight;
+        delete[] gradients;
+    }
+}
+
+"""
+
+# Compile the kernel
+mod = SourceModule(kernel_code)
+evaluate_fitness = mod.get_function("evaluate_fitness")
+
+def evaluate_test_set(X_test, y_test, X_train, y_train, best_hyperparameters, penalty_mod_mapping, Solver_mapping):
+    # Extract hyperparameters
+    penalty_idx = int(best_hyperparameters[0])
+    C = best_hyperparameters[1]
+    solver_idx = int(best_hyperparameters[2])
+    learning_rate = best_hyperparameters[3]
+
+    # Initialize logistic regression model with best hyperparameters
+    model = LogisticRegression(penalty=penalty_mod_mapping[penalty_idx],
+                               C=C,
+                               solver=Solver_mapping[solver_idx],
+                               max_iter=1000)
+
+    # Fit the model on the training data
+    model.fit(X_train, y_train)
+
+    # Predict on the test set
+    y_pred = model.predict(X_test)
+
+    # Calculate evaluation metrics
+    accuracy = accuracy_score(y_test, y_pred)
+    precision = precision_score(y_test, y_pred)
+    recall = recall_score(y_test, y_pred)
+    f1 = f1_score(y_test, y_pred)
+    mcc = matthews_corrcoef(y_test, y_pred)
+    confusion_mat = confusion_matrix(y_test, y_pred)
+
+    return accuracy, precision, recall, f1, mcc, confusion_mat
+
+# Define fitness evaluation function using CUDA
+def evaluate_fitness_cuda(accuracies, X_train_scaled, X_train, y_train, hyperparameters, num_particles, num_penalty_mod, num_C_values,
+                          num_Solver, num_Learning_rates):
+    num_particles = hyperparameters.shape[0]
+    fitness = np.zeros(num_particles, dtype=np.float32)
+    num_features = X_train.shape[1]
+    num_samples = X_train.shape[0]
+    
+    # Allocate memory on the device
+    X_train_gpu = drv.mem_alloc(X_train_scaled.nbytes)
+    y_train_gpu = drv.mem_alloc(y_train.nbytes)
+    hyperparameters_gpu = drv.mem_alloc(hyperparameters.nbytes)
+    accuracies_gpu = drv.mem_alloc(accuracies.nbytes)
+
+    # Transfer data to the device
+    drv.memcpy_htod(X_train_gpu, X_train_scaled)
+    drv.memcpy_htod(y_train_gpu, y_train)
+    drv.memcpy_htod(hyperparameters_gpu, hyperparameters)
+    
+    # Define grid and block dimensions
+    block_size = 256
+    grid_size = (num_particles + block_size - 1) // block_size
+
+    # Calculate shared memory size
+    shared_memory_size = (2 * num_features) * 4  # 2 arrays of floats of size num_features
+    
+    # Launch the kernel
+    try:
+        evaluate_fitness(hyperparameters_gpu, X_train_gpu, y_train_gpu, accuracies_gpu,
+                            np.int32(num_features), np.int32(num_samples), np.int32(num_particles),
+                            block=(block_size, 1, 1), grid=(grid_size, 1, 1), shared=shared_memory_size)
+    except drv.driver.CudaAPIError as e:
+        print("CUDA error:", e)
+    
+    # Copy results back to CPU
+    drv.memcpy_dtoh(accuracies, accuracies_gpu)
+    
+    return accuracies
+
+# Define Particle Swarm Optimization function
+def particle_swarm_optimization(accuracies, penalty_mod, C_values, Solver, Learning_rates, X_train_scaled, X_train, y_train, X_test, y_test, num_particles, num_generations, inertia, cognitive_coeff, social_coeff):
+    hyperparameter_length = 4
+    num_penalty_mod = len(penalty_mod)
+    num_C_values = len(C_values)
+    num_Solver = len(Solver)
+    num_Learning_rates = len(Learning_rates)
+
+    # Initialize population randomly
+    particles_position = np.empty((num_particles, hyperparameter_length), dtype=np.float32)
+    for i in range(num_particles):
+        particles_position[i, 0] = np.random.randint(0, num_penalty_mod)  # Randomly select penalty index
+        particles_position[i, 1] = np.random.choice(C_values)  # Randomly select regularization constant
+        particles_position[i, 2] = np.random.randint(0, num_Solver)  # Randomly select solver index
+        particles_position[i, 3] = np.random.choice(Learning_rates)  # Randomly select learning rate
+
+    particles_velocity = np.random.uniform(-1, 1, size=(num_particles, hyperparameter_length)).astype(np.float32)
+    
+    # Initialize best particle and global best
+    best_particle_position = particles_position.copy()
+    best_particle_fitness = evaluate_fitness_cuda(accuracies, X_train_scaled, X_train, y_train, 
+                                                  particles_position, num_particles, num_penalty_mod, num_C_values,
+                                                  num_Solver, num_Learning_rates)
+    global_best_index = np.argmax(best_particle_fitness)
+    global_best_position = best_particle_position[global_best_index]
+    global_best_fitness = best_particle_fitness[global_best_index]
+    
+    # Metrics
+    start_time = time.time()
+    gpu_start = drv.Event()
+    gpu_end = drv.Event()
+    gpu_start.record()
+    function_evaluations = 0
+    
+    # Iterate over generations
+    for gen in range(num_generations):
+        # Update particle positions and velocities
+        inertia_weight = inertia - (inertia - 0.1) * gen / num_generations
+        cognitive_velocity = cognitive_coeff * np.random.rand(num_particles, hyperparameter_length).astype(np.float32) * (best_particle_position - particles_position)
+        social_velocity = social_coeff * np.random.rand(num_particles, hyperparameter_length).astype(np.float32) * (global_best_position - particles_position)
+        particles_velocity = inertia_weight * particles_velocity + cognitive_velocity + social_velocity
+        particles_position = particles_position + particles_velocity
+        
+        # Clip particle positions to stay within search space
+        particles_position[:, 0] = np.clip(particles_position[:, 0], 0, num_penalty_mod - 1)
+        particles_position[:, 1] = np.clip(particles_position[:, 1], C_values.min(), C_values.max())
+        particles_position[:, 2] = np.clip(particles_position[:, 2], 0, num_Solver - 1)
+        particles_position[:, 3] = np.clip(particles_position[:, 3], Learning_rates.min(), Learning_rates.max())
+        
+        # Evaluate fitness of particles
+        particle_fitness = evaluate_fitness_cuda(accuracies, X_train_scaled, X_train, y_train, 
+                                                  particles_position, num_particles, num_penalty_mod, num_C_values,
+                                                  num_Solver, num_Learning_rates)
+        
+        function_evaluations += num_particles
+        # Update best particle positions and global best
+        improved_indices = particle_fitness > best_particle_fitness
+        best_particle_position[improved_indices] = particles_position[improved_indices]
+        best_particle_fitness[improved_indices] = particle_fitness[improved_indices]
+        
+        if np.max(particle_fitness) > global_best_fitness:
+            global_best_index = np.argmax(particle_fitness)
+            global_best_position = particles_position[global_best_index]
+            global_best_fitness = particle_fitness[global_best_index]
+
+        
+        
+        # Print progress
+        print("\n")    
+        print(f"Generation: {gen}, Best Fitness: {global_best_fitness}")
+        print("\n")  
+     
+    gpu_end.record()
+    gpu_end.synchronize()
+
+    end_time = time.time()
+
+    cpu_time = end_time - start_time
+    gpu_time = gpu_start.time_till(gpu_end) * 1e-3
+    
+    return global_best_position, global_best_fitness, cpu_time, gpu_time, function_evaluations
+
+
+# Host code
+def main(x):
+    process = psutil.Process()
+    memory_start = process.memory_info().rss
+
+    # Load the cancer dataset
+    cancer = load_breast_cancer()
+    X = cancer.data
+    y = cancer.target
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    y_train = y_train.astype(np.float32)
+    y_test = y_test.astype(np.float32)
+    
+    # Standardize the features
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    #print(X_train_scaled)
+    
+    # Hyperparameter search space
+    hyperparameter_length = 4
+    penalty_mod_mapping = ["l1", "l2"]
+    penalty_mod = [0, 1]
+    C_values = np.logspace(-1, 1, num=10*x)
+    Solver_mapping = ["liblinear", "saga"]
+    Solver = [0, 1]
+    Learning_rates = np.logspace(-1, 0, num=10*x)
+    
+    # Define the genetic algorithm parameters
+    num_particles=100
+    num_generations=10
+    inertia=8.5
+    cognitive_coeff=1.5
+    social_coeff=1.0
+
+    accuracies = np.zeros(num_particles, dtype=np.float32)
+    X_train_scaled = X_train_scaled.flatten().astype(np.float32)
+    
+    # Compile the kernel
+    mod = SourceModule(kernel_code)
+    evaluate_fitness = mod.get_function("evaluate_fitness")
+    
+    # Start time
+    start_time = time.time()
+    
+    # Run Particle Swarm Optimization
+    best_hyperparameters, best_fitness, cpu_time, gpu_time, function_evaluations = particle_swarm_optimization(accuracies, penalty_mod, 
+                                                                     C_values, Solver, Learning_rates, X_train_scaled, X_train, y_train,
+                                                                     X_test, y_test, num_particles, num_generations, inertia,
+                                                                     cognitive_coeff, social_coeff)
+    # End time
+    end_time = time.time()
+
+    # Calculate duration
+    duration = end_time - start_time
+    
+   # Find the best solution 
+    print("\n")
+    print("\n")
+    print("---------Hyperparameter Search Summary----------")
+    print("ML Model used: Logistic Regression")
+    print("Dataset: Breast cancer dataset")
+    print("Hyperparameter search method: Parallel Particle Swarm Optimization")
+    print("Parallel strategy: 1C/RS/SPSS")
+    best_penalty_idx = int(best_hyperparameters[0])
+    best_solution_idx = int(best_hyperparameters[2])
+    print("\n")
+    print("-----Best hyperparameter combination found-----")
+    print("Penalty: ", penalty_mod_mapping[best_penalty_idx])
+    print("Regularization constant, C: ", best_hyperparameters[1])
+    print("Solution: ", Solver_mapping[best_solution_idx])
+    print("Learning rate: ", best_hyperparameters[3])
+    print("Best fitness (accuracy):", best_fitness)
+    print("Total search time:", duration, "seconds")
+    print("\n")
+    print("-----Evaluating best hyperparameters on test set-----")
+    accuracy, precision, recall, f1, mcc, confusion_mat = evaluate_test_set(X_test, y_test, X_train, y_train, best_hyperparameters, penalty_mod_mapping, Solver_mapping)
+    print("Accuracy:", accuracy)
+    print("Precision:", precision)
+    print("Recall:", recall)
+    print("F1 Score:", f1)
+    print("MCC:", mcc)
+    print("Confusion Matrix:\n", confusion_mat)
+    print("\n")
+    print("-----Parallel Search Strategy Performance-----")
+    memory_end = process.memory_info().rss
+    memory_usage = (memory_end - memory_start) / (1024 * 1024)
+    print("Memory usage:", memory_usage, "MB")
+    print("Total search time (CPU):", cpu_time, "seconds")
+    print("Total search time (GPU):", gpu_time, "seconds")
+    print("Total function evaluations:", function_evaluations)
+    print("\n")
+    print("\n")
+    print("\n")
+    
+    
+    
+if __name__ == "__main__":
+    x_values = [1]
+    for i in range(len(x_values)):
+        main(x_values[i])
+

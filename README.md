@@ -1,4 +1,4 @@
-# CS 239 – Parallel Metaheuristics
+# CS 239 – Parallel Computing
 
 This repository contains CUDA programming exercises and a final project exploring the application of **metaheuristic optimization algorithms** for curve fitting in **non-linear regression**, implemented in Python and evaluated for both accuracy and runtime performance.
 
